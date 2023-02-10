@@ -20,7 +20,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	exec "golang.org/x/sys/execabs"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -28,15 +27,19 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+
+	exec "golang.org/x/sys/execabs"
 )
 
 var (
-	flagP       = flag.Int("p", runtime.NumCPU(), "run `N` processes in parallel")
-	flagTimeout = flag.Duration("timeout", 10*time.Minute, "timeout each process after `duration`")
-	flagKill    = flag.Bool("kill", true, "kill timed out processes if true, otherwise just print pid (to attach with gdb)")
-	flagFailure = flag.String("failure", "", "fail only if output matches `regexp`")
-	flagIgnore  = flag.String("ignore", "", "ignore failure if output matches `regexp`")
-	flagOutput  = flag.String("o", defaultPrefix(), "output failure logs to `path` plus a unique suffix")
+	flagP        = flag.Int("p", runtime.NumCPU(), "run `N` processes in parallel")
+	flagTimeout  = flag.Duration("timeout", 10*time.Minute, "timeout each process after `duration`")
+	flagKill     = flag.Bool("kill", true, "kill timed out processes if true, otherwise just print pid (to attach with gdb)")
+	flagFailure  = flag.String("failure", "", "fail only if output matches `regexp`")
+	flagIgnore   = flag.String("ignore", "", "ignore failure if output matches `regexp`")
+	flagOutput   = flag.String("o", defaultPrefix(), "output failure logs to `path` plus a unique suffix")
+	flagRuns     = flag.Int("runs", 0, "number of times to run test processes")
+	flagFailOnce = flag.Bool("fail-once", false, "terminate after first failure")
 )
 
 func init() {
@@ -118,35 +121,44 @@ func main() {
 	runs, fails := 0, 0
 	start := time.Now()
 	ticker := time.NewTicker(5 * time.Second).C
+	elapsed := func() time.Duration { return time.Since(start).Truncate(time.Second) }
+	pct := func() string {
+		if fails > 0 {
+			return fmt.Sprintf(" (%0.2f%%)", 100.0*float64(fails)/float64(runs))
+		}
+		return ""
+	}
 	for {
 		select {
 		case out := <-res:
 			runs++
-			if len(out) == 0 {
-				continue
+			if len(out) != 0 {
+				fails++
+				dir, path := filepath.Split(*flagOutput)
+				f, err := ioutil.TempFile(dir, path)
+				if err != nil {
+					fmt.Printf("failed to create temp file: %v\n", err)
+					os.Exit(1)
+				}
+				f.Write(out)
+				f.Close()
+				if !*flagFailOnce && len(out) > 2<<10 {
+					out := out[:2<<10]
+					fmt.Printf("\n%s\n%s\n…\n", f.Name(), out)
+				} else {
+					fmt.Printf("\n%s\n%s\n", f.Name(), out)
+				}
+				if *flagFailOnce {
+					fmt.Printf("failure after %v runs %s in %v\n", runs, pct(), elapsed())
+					os.Exit(0)
+				}
 			}
-			fails++
-			dir, path := filepath.Split(*flagOutput)
-			f, err := ioutil.TempFile(dir, path)
-			if err != nil {
-				fmt.Printf("failed to create temp file: %v\n", err)
-				os.Exit(1)
-			}
-			f.Write(out)
-			f.Close()
-			if len(out) > 2<<10 {
-				out := out[:2<<10]
-				fmt.Printf("\n%s\n%s\n…\n", f.Name(), out)
-			} else {
-				fmt.Printf("\n%s\n%s\n", f.Name(), out)
+			if *flagRuns != 0 && runs >= *flagRuns {
+				fmt.Printf("completed %v runs in %v with %v failures%s\n", runs, elapsed(), fails, pct())
+				os.Exit(0)
 			}
 		case <-ticker:
-			elapsed := time.Since(start).Truncate(time.Second)
-			var pct string
-			if fails > 0 {
-				pct = fmt.Sprintf(" (%0.2f%%)", 100.0*float64(fails)/float64(runs))
-			}
-			fmt.Printf("%v: %v runs so far, %v failures%s\n", elapsed, runs, fails, pct)
+			fmt.Printf("%v: %v runs so far, %v failures%s\n", elapsed(), runs, fails, pct())
 		}
 	}
 }
